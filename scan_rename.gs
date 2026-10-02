@@ -12,6 +12,12 @@ const PRIMARY_MODEL = 'gemini-3.8-flash';
 // メインが混雑（503等）の場合に切り替える代替モデルの数（利用可能なflash系モデルから自動選定）
 const MAX_FALLBACK_MODELS = 2;
 
+// この容量を超えるファイルは、Gemini File API（アップロード方式）で送信する
+// （直接送信はBase64化で約1.33倍に膨らみ、20MBの上限や混雑時の失敗に掛かりやすいため）
+const INLINE_MAX_BYTES = 8 * 1024 * 1024;   // 8MB
+// GAS（UrlFetchApp）で送信できる上限（50MB）。これを超えるファイルは処理しない
+const UPLOAD_MAX_BYTES = 48 * 1024 * 1024;  // 48MB
+
 // 実行全体の締切（GASの6分制限に掛からないよう、再試行の待機もこの時刻までに収める）
 let RUN_DEADLINE = 0;
 
@@ -87,7 +93,7 @@ async function processFile(file, mimeType, destFolder) {
   }
 
   // AI処理の実行（ファイル名＋各ページの回転角度を取得）
-  const result = getNewFilenameFromGemini(Utilities.base64Encode(bytes), mimeType, pageCount);
+  const result = getNewFilenameFromGemini(bytes, mimeType, pageCount, file.getName());
   if (!result) {
     Logger.log(`【失敗】ファイル名を取得できませんでした`);
     return;
@@ -135,13 +141,42 @@ async function processFile(file, mimeType, destFolder) {
  * Geminiでファイル名と各ページの回転角度を取得
  * 戻り値: { baseName: '20260929_領収書_〇〇不動産', rotations: [0, 90, ...] } / 失敗時 null
  */
-function getNewFilenameFromGemini(base64Data, mimeType, pageCount) {
+function getNewFilenameFromGemini(bytes, mimeType, pageCount, displayName) {
   const apiKey = PropertiesService.getScriptProperties().getProperty('GEMINI_API_KEY');
   if (!apiKey) {
     Logger.log("エラー: APIキーがスクリプトプロパティに設定されていません。");
     return null;
   }
 
+  const sizeMB = (bytes.length / 1024 / 1024).toFixed(1);
+  if (bytes.length > UPLOAD_MAX_BYTES) {
+    Logger.log(`【スキップ】ファイル容量が大きすぎるため処理できません（${sizeMB}MB）。スキャン設定（解像度・カラー）を下げて取り込み直してください。`);
+    return null;
+  }
+
+  // 容量に応じて送信方法を切り替え（小：直接送信／大：File APIでアップロードして参照）
+  let filePart;
+  let uploaded = null;
+  if (bytes.length <= INLINE_MAX_BYTES) {
+    filePart = { "inline_data": { "mime_type": mimeType, "data": Utilities.base64Encode(bytes) } };
+  } else {
+    Logger.log(`ファイル容量が大きいため（${sizeMB}MB）、Gemini File APIでアップロードします...`);
+    uploaded = uploadToGeminiFileApi(bytes, mimeType, displayName, apiKey);
+    if (!uploaded) return null;
+    filePart = { "file_data": { "mime_type": mimeType, "file_uri": uploaded.uri } };
+  }
+
+  try {
+    return requestGemini(apiKey, filePart, pageCount);
+  } finally {
+    if (uploaded) deleteGeminiFile(uploaded.name, apiKey);
+  }
+}
+
+/**
+ * Geminiへの問い合わせ本体（モデル切替＋リトライ）
+ */
+function requestGemini(apiKey, filePart, pageCount) {
 
   const prompt =
     "あなたは書類のスキャンデータを自動で整理するアシスタントです。\n" +
@@ -158,12 +193,7 @@ function getNewFilenameFromGemini(base64Data, mimeType, pageCount) {
     "contents": [{
       "parts": [
         { "text": prompt },
-        {
-          "inline_data": {
-            "mime_type": mimeType,
-            "data": base64Data
-          }
-        }
+        filePart
       ]
     }]
   };
@@ -181,7 +211,7 @@ function getNewFilenameFromGemini(base64Data, mimeType, pageCount) {
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
     const model = models[(attempt - 1) % models.length];
     const nextModel = models[attempt % models.length];
-    const url = `https://generativelanguage.googleapis.com/v1/models/${model}:generateContent?key=${apiKey}`;
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
     try {
       const response = UrlFetchApp.fetch(url, options);
       const responseText = response.getContentText();
@@ -231,6 +261,77 @@ function getNewFilenameFromGemini(base64Data, mimeType, pageCount) {
 }
 
 /**
+ * Gemini File APIへファイルをアップロード（再開可能アップロード）
+ * 戻り値: { name: 'files/xxxx', uri: 'https://...' } / 失敗時 null
+ */
+function uploadToGeminiFileApi(bytes, mimeType, displayName, apiKey) {
+  try {
+    // ① アップロード開始（アップロード先URLを取得）
+    const startRes = UrlFetchApp.fetch(`https://generativelanguage.googleapis.com/upload/v1beta/files?key=${apiKey}`, {
+      method: 'post',
+      contentType: 'application/json',
+      headers: {
+        'X-Goog-Upload-Protocol': 'resumable',
+        'X-Goog-Upload-Command': 'start',
+        'X-Goog-Upload-Header-Content-Length': String(bytes.length),
+        'X-Goog-Upload-Header-Content-Type': mimeType
+      },
+      payload: JSON.stringify({ file: { display_name: displayName } }),
+      muteHttpExceptions: true
+    });
+    const headers = startRes.getAllHeaders();
+    const uploadUrlKey = Object.keys(headers).find(k => k.toLowerCase() === 'x-goog-upload-url');
+    if (!uploadUrlKey) {
+      Logger.log(`File APIのアップロード開始に失敗しました (ステータス: ${startRes.getResponseCode()}): ${startRes.getContentText()}`);
+      return null;
+    }
+
+    // ② ファイル本体を送信
+    const upRes = UrlFetchApp.fetch(headers[uploadUrlKey], {
+      method: 'post',
+      contentType: mimeType,
+      headers: { 'X-Goog-Upload-Offset': '0', 'X-Goog-Upload-Command': 'upload, finalize' },
+      payload: bytes,
+      muteHttpExceptions: true
+    });
+    if (upRes.getResponseCode() !== 200) {
+      Logger.log(`File APIへのアップロードに失敗しました (ステータス: ${upRes.getResponseCode()}): ${upRes.getContentText()}`);
+      return null;
+    }
+    let info = JSON.parse(upRes.getContentText()).file;
+
+    // ③ Gemini側の取り込み完了（ACTIVE）を待つ（最大60秒）
+    for (let i = 0; i < 12 && info.state === 'PROCESSING'; i++) {
+      Utilities.sleep(5000);
+      const st = UrlFetchApp.fetch(`https://generativelanguage.googleapis.com/v1beta/${info.name}?key=${apiKey}`, { muteHttpExceptions: true });
+      info = JSON.parse(st.getContentText());
+    }
+    if (info.state && info.state !== 'ACTIVE') {
+      Logger.log(`File APIでの取り込みが完了しませんでした (状態: ${info.state})`);
+      deleteGeminiFile(info.name, apiKey);
+      return null;
+    }
+
+    Logger.log(`File APIへのアップロード完了: ${info.name}`);
+    return { name: info.name, uri: info.uri };
+  } catch (e) {
+    Logger.log(`File APIへのアップロード中にエラーが発生しました: ${e.toString()}`);
+    return null;
+  }
+}
+
+/**
+ * File APIにアップロードしたファイルを削除（※削除しなくても48時間で自動削除）
+ */
+function deleteGeminiFile(name, apiKey) {
+  try {
+    UrlFetchApp.fetch(`https://generativelanguage.googleapis.com/v1beta/${name}?key=${apiKey}`, { method: 'delete', muteHttpExceptions: true });
+  } catch (e) {
+    // 削除失敗は処理に影響しないため無視
+  }
+}
+
+/**
  * 使用するモデルの候補リストを取得（メイン＋代替モデル）
  * 代替モデルは、このAPIキーで利用可能なflash系モデルから新しい順に自動選定（6時間キャッシュ）
  */
@@ -242,7 +343,7 @@ function getModelCandidates(apiKey) {
 
   let list = [PRIMARY_MODEL];
   try {
-    const res = UrlFetchApp.fetch(`https://generativelanguage.googleapis.com/v1/models?pageSize=1000&key=${apiKey}`, { muteHttpExceptions: true });
+    const res = UrlFetchApp.fetch(`https://generativelanguage.googleapis.com/v1beta/models?pageSize=1000&key=${apiKey}`, { muteHttpExceptions: true });
     if (res.getResponseCode() === 200) {
       const version = n => { const m = n.match(/gemini-(\d+(?:\.\d+)?)/); return m ? parseFloat(m[1]) : 0; };
       const fallbacks = (JSON.parse(res.getContentText()).models || [])

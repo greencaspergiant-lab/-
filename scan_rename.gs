@@ -7,9 +7,10 @@ const PDF_LIB_URL = 'https://cdn.jsdelivr.net/npm/pdf-lib@1.17.1/dist/pdf-lib.mi
 // 画像をPDF化する際のページサイズ（長辺をA4相当 842pt に合わせる）
 const PAGE_LONG_SIDE_PT = 842;
 
-// 使用するGeminiモデル（503混雑時は再試行ごとに次のモデルへ切り替え）
-// ※2つ目以降に、Google AI Studioで利用可能なモデル名を追加すると混雑時の代替になります
-const GEMINI_MODELS = ['gemini-3.8-flash'];
+// 使用するGeminiモデル（メイン）
+const PRIMARY_MODEL = 'gemini-3.8-flash';
+// メインが混雑（503等）の場合に切り替える代替モデルの数（利用可能なflash系モデルから自動選定）
+const MAX_FALLBACK_MODELS = 2;
 
 // 実行全体の締切（GASの6分制限に掛からないよう、再試行の待機もこの時刻までに収める）
 let RUN_DEADLINE = 0;
@@ -174,10 +175,12 @@ function getNewFilenameFromGemini(base64Data, mimeType, pageCount) {
     "muteHttpExceptions": true
   };
 
-  // 【追加2】エラー時（503や429）に、最大3回までリトライ（再挑戦）する仕組み
+  // 【追加2】エラー時（503や429）に、モデルを切り替えながら最大3回までリトライ（再挑戦）する仕組み
+  const models = getModelCandidates(apiKey);
   let maxRetries = 3;
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
-    const model = GEMINI_MODELS[(attempt - 1) % GEMINI_MODELS.length];
+    const model = models[(attempt - 1) % models.length];
+    const nextModel = models[attempt % models.length];
     const url = `https://generativelanguage.googleapis.com/v1/models/${model}:generateContent?key=${apiKey}`;
     try {
       const response = UrlFetchApp.fetch(url, options);
@@ -190,7 +193,10 @@ function getNewFilenameFromGemini(base64Data, mimeType, pageCount) {
         const parts = (json.candidates && json.candidates[0].content && json.candidates[0].content.parts) || [];
         const text = parts.map(p => p.text || '').join('').trim();
         const parsed = parseGeminiResult(text, pageCount);
-        if (parsed) return parsed;
+        if (parsed) {
+          Logger.log(`使用モデル: ${model}`);
+          return parsed;
+        }
 
         Logger.log(`APIレスポンスの形式が想定外です: ${responseText}`);
         return null; // 形式エラーの場合は再試行せず終了
@@ -206,15 +212,15 @@ function getNewFilenameFromGemini(base64Data, mimeType, pageCount) {
           return null;
         }
 
-        // 次の再試行まで少し待つ（1回目は20秒、2回目は40秒...と増やす）
-        const waitTime = attempt * 20000;
+        // 次の再試行まで少し待つ（別モデルに切り替える場合は5秒、同じモデルの場合は20秒→40秒と増やす）
+        const waitTime = nextModel !== model ? 5000 : attempt * 20000;
 
         // 待機＋再呼び出し（約1分）で6分制限を超えそうなら、今回は見送り（ファイルは未処理データに残り次回再処理）
         if (RUN_DEADLINE && Date.now() + waitTime + 60000 > RUN_DEADLINE) {
           Logger.log("実行時間の上限が近いため再試行を見送ります。このファイルは次回実行時に再処理されます。");
           return null;
         }
-        Logger.log(`${waitTime/1000}秒後に再試行します...`);
+        Logger.log(`${waitTime/1000}秒後に再試行します（モデル: ${nextModel}）...`);
         Utilities.sleep(waitTime);
       }
     } catch (err) {
@@ -222,6 +228,42 @@ function getNewFilenameFromGemini(base64Data, mimeType, pageCount) {
       return null;
     }
   }
+}
+
+/**
+ * 使用するモデルの候補リストを取得（メイン＋代替モデル）
+ * 代替モデルは、このAPIキーで利用可能なflash系モデルから新しい順に自動選定（6時間キャッシュ）
+ */
+function getModelCandidates(apiKey) {
+  const cache = CacheService.getScriptCache();
+  const cacheKey = 'gemini_models_' + PRIMARY_MODEL;
+  const cached = cache.get(cacheKey);
+  if (cached) return JSON.parse(cached);
+
+  let list = [PRIMARY_MODEL];
+  try {
+    const res = UrlFetchApp.fetch(`https://generativelanguage.googleapis.com/v1/models?pageSize=1000&key=${apiKey}`, { muteHttpExceptions: true });
+    if (res.getResponseCode() === 200) {
+      const version = n => { const m = n.match(/gemini-(\d+(?:\.\d+)?)/); return m ? parseFloat(m[1]) : 0; };
+      const fallbacks = (JSON.parse(res.getContentText()).models || [])
+        .filter(m => (m.supportedGenerationMethods || []).includes('generateContent'))
+        .map(m => m.name.replace('models/', ''))
+        .filter(n => /flash/.test(n) && !/(image|tts|audio|live|embedding|exp)/.test(n) && n !== PRIMARY_MODEL)
+        .sort((a, b) =>
+          (/preview/.test(a) - /preview/.test(b)) ||   // 正式版を優先
+          (version(b) - version(a)) ||                 // 新しい世代を優先
+          (/lite/.test(a) - /lite/.test(b)));          // 通常版をlite版より優先
+      list = list.concat([...new Set(fallbacks)].slice(0, MAX_FALLBACK_MODELS));
+    } else {
+      Logger.log(`モデル一覧の取得に失敗したため、メインモデルのみで実行します（ステータス: ${res.getResponseCode()}）`);
+    }
+  } catch (e) {
+    Logger.log(`モデル一覧の取得に失敗したため、メインモデルのみで実行します: ${e.toString()}`);
+  }
+
+  Logger.log(`使用モデル候補: ${list.join(' → ')}`);
+  cache.put(cacheKey, JSON.stringify(list), 6 * 60 * 60);
+  return list;
 }
 
 /**
@@ -339,7 +381,7 @@ async function runOnce() {
 }
 
 /**
- * 【補助】このAPIキーで利用可能なGeminiモデルの一覧をログに出力（GEMINI_MODELSの代替候補確認用）
+ * 【補助】このAPIキーで利用可能なGeminiモデルの一覧をログに出力（代替モデルの確認用）
  */
 function listGeminiModels() {
   const apiKey = PropertiesService.getScriptProperties().getProperty('GEMINI_API_KEY');

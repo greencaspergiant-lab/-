@@ -1,5 +1,5 @@
-const SOURCE_FOLDER_ID = '1Oln0vKLfmNInPyHVMPnR22tEtp9KXozB'; // scan_未処理データ
-const DEST_FOLDER_ID   = '1bTo9kY4ZJQCtMeURLJZEHOTIHoyfWJJN'; // scan_処理済みデータ
+const SOURCE_FOLDER_ID = '1Oln0vKLfmNInPyHVMPnR22tEtp9KXozB'; // マイドライブ/scan/未処理データ
+const DEST_FOLDER_ID   = '1bTo9kY4ZJQCtMeURLJZEHOTIHoyfWJJN'; // マイドライブ/scan/処理済みデータ
 
 // PDFの回転・画像→PDF変換に使用するライブラリ（pdf-lib）
 const PDF_LIB_URL = 'https://cdn.jsdelivr.net/npm/pdf-lib@1.17.1/dist/pdf-lib.min.js';

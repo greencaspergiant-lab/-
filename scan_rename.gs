@@ -16,7 +16,7 @@ let RUN_DEADLINE = 0;
 
 async function checkForNewFiles() {
   const startTime = Date.now(); // 実行開始時間を記録
-  const MAX_EXECUTION_TIME = 4.5 * 60 * 1000; // 4.5分（270,000ミリ秒）を上限とする
+  const START_CUTOFF = 2 * 60 * 1000; // 新しいファイルの処理開始は実行開始から2分以内に限る（1ファイル最大3〜4分かかるため）
   RUN_DEADLINE = startTime + 5.5 * 60 * 1000;  // 再試行は開始から5.5分以内に収める
 
   // 二重起動防止（前回の処理が実行中なら今回はスキップ）
@@ -33,8 +33,8 @@ async function checkForNewFiles() {
 
     while (files.hasNext()) {
       // 【追加1】GASの6分制限が近づいたら処理を安全に中断
-      if (Date.now() - startTime > MAX_EXECUTION_TIME) {
-        Logger.log("【警告】GASの6分制限が近づいたため、処理を安全に中断します。残りのファイルは次回実行時に処理されます。");
+      if (Date.now() - startTime > START_CUTOFF) {
+        Logger.log("【警告】GASの6分制限に備え、今回の処理はここまでとします。残りのファイルは次回実行時に処理されます。");
         break;
       }
 
@@ -46,10 +46,14 @@ async function checkForNewFiles() {
       Logger.log(`処理開始: ${file.getName()}`);
       await processFile(file, mimeType, destFolder);
 
-      // API制限回避の待機（60秒）
+      // API制限回避の待機（15秒）※待機後に処理開始期限を過ぎる場合は待たずに終了
       if (files.hasNext()) {
-        Logger.log(`次のファイル処理まで60秒待機します...`);
-        Utilities.sleep(60000);
+        if (Date.now() - startTime + 15000 > START_CUTOFF) {
+          Logger.log("今回の処理はここまでとします。残りのファイルは次回実行時に処理されます。");
+          break;
+        }
+        Logger.log(`次のファイル処理まで15秒待機します...`);
+        Utilities.sleep(15000);
       }
     }
   } catch (e) {
@@ -316,7 +320,7 @@ function setupTrigger() {
   ScriptApp.getProjectTriggers()
     .filter(t => t.getHandlerFunction() === 'checkForNewFiles')
     .forEach(t => ScriptApp.deleteTrigger(t));
-  ScriptApp.newTrigger('checkForNewFiles').timeBased().everyMinutes(10).create();
+  ScriptApp.newTrigger('checkForNewFiles').timeBased().everyMinutes(5).create();
 }
 
 /**

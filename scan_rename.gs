@@ -16,7 +16,7 @@ const MAX_FALLBACK_MODELS = 2;
 // ENABLE_ROTATION = false にすると、向きは変えずにファイル名の変更＆移動のみ行う
 const ENABLE_ROTATION = true;
 // この容量を超えるPDFは向き補正を行わず、ファイル名の変更＆移動のみ行う（GASのメモリ・時間制限対策）
-const ROTATE_MAX_BYTES = 15 * 1024 * 1024;  // 15MB
+const ROTATE_MAX_BYTES = 5 * 1024 * 1024;   // 5MB
 
 // この容量を超えるファイルは、Gemini File API（アップロード方式）で送信する
 // （直接送信はBase64化で約1.33倍に膨らみ、20MBの上限や混雑時の失敗に掛かりやすいため）
@@ -99,14 +99,17 @@ async function checkForNewFiles() {
  * 1ファイル分の処理（AI解析 → 向き補正 → リネーム＆移動）
  */
 async function processFile(file, mimeType, destFolder) {
-  const bytes = file.getBlob().getBytes();
+  // ※大容量ファイルはバイト配列に展開するとGASのメモリ不足になるため、Blobのまま扱い、必要な場合のみ展開する
+  const blob = file.getBlob();
+  const size = file.getSize();
   const isPdf = mimeType === MimeType.PDF;
   const isConvertibleImage = ENABLE_ROTATION && (mimeType === MimeType.JPEG || mimeType === MimeType.PNG);
 
   // 向き補正を行うか判定（無効設定、または大容量PDFの場合はファイル名の変更のみ）
-  const rotate = ENABLE_ROTATION && !(isPdf && bytes.length > ROTATE_MAX_BYTES);
+  const rotate = ENABLE_ROTATION && !(isPdf && size > ROTATE_MAX_BYTES);
+  const bytes = rotate ? blob.getBytes() : null;  // 向き補正時のみ展開
   if (ENABLE_ROTATION && !rotate) {
-    Logger.log(`容量が大きいため（${(bytes.length / 1024 / 1024).toFixed(1)}MB）、向き補正は行わずファイル名の変更のみ行います。`);
+    Logger.log(`容量が大きいため（${(size / 1024 / 1024).toFixed(1)}MB）、向き補正は行わずファイル名の変更のみ行います。`);
   }
 
   // PDFはページ数を取得してGeminiに伝える（ページごとの向き判定のため）
@@ -125,7 +128,7 @@ async function processFile(file, mimeType, destFolder) {
   }
 
   // AI処理の実行（ファイル名＋各ページの回転角度を取得）
-  const result = getNewFilenameFromGemini(bytes, mimeType, pageCount, file.getName());
+  const result = getNewFilenameFromGemini(blob, size, mimeType, pageCount, file.getName());
   if (!result) {
     Logger.log(`【失敗】ファイル名を取得できませんでした`);
     return false;
@@ -174,15 +177,15 @@ async function processFile(file, mimeType, destFolder) {
  * Geminiでファイル名と各ページの回転角度を取得
  * 戻り値: { baseName: '20260929_領収書_〇〇不動産', rotations: [0, 90, ...] } / 失敗時 null
  */
-function getNewFilenameFromGemini(bytes, mimeType, pageCount, displayName) {
+function getNewFilenameFromGemini(blob, size, mimeType, pageCount, displayName) {
   const apiKey = PropertiesService.getScriptProperties().getProperty('GEMINI_API_KEY');
   if (!apiKey) {
     Logger.log("エラー: APIキーがスクリプトプロパティに設定されていません。");
     return null;
   }
 
-  const sizeMB = (bytes.length / 1024 / 1024).toFixed(1);
-  if (bytes.length > UPLOAD_MAX_BYTES) {
+  const sizeMB = (size / 1024 / 1024).toFixed(1);
+  if (size > UPLOAD_MAX_BYTES) {
     Logger.log(`【スキップ】ファイル容量が大きすぎるため処理できません（${sizeMB}MB）。スキャン設定（解像度・カラー）を下げて取り込み直してください。`);
     return null;
   }
@@ -190,11 +193,11 @@ function getNewFilenameFromGemini(bytes, mimeType, pageCount, displayName) {
   // 容量に応じて送信方法を切り替え（小：直接送信／大：File APIでアップロードして参照）
   let filePart;
   let uploaded = null;
-  if (bytes.length <= INLINE_MAX_BYTES) {
-    filePart = { "inline_data": { "mime_type": mimeType, "data": Utilities.base64Encode(bytes) } };
+  if (size <= INLINE_MAX_BYTES) {
+    filePart = { "inline_data": { "mime_type": mimeType, "data": Utilities.base64Encode(blob.getBytes()) } };
   } else {
     Logger.log(`ファイル容量が大きいため（${sizeMB}MB）、Gemini File APIでアップロードします...`);
-    uploaded = uploadToGeminiFileApi(bytes, mimeType, displayName, apiKey);
+    uploaded = uploadToGeminiFileApi(blob, size, mimeType, displayName, apiKey);
     if (!uploaded) return null;
     filePart = { "file_data": { "mime_type": mimeType, "file_uri": uploaded.uri } };
   }
@@ -303,7 +306,7 @@ function requestGemini(apiKey, filePart, pageCount) {
  * Gemini File APIへファイルをアップロード（再開可能アップロード）
  * 戻り値: { name: 'files/xxxx', uri: 'https://...' } / 失敗時 null
  */
-function uploadToGeminiFileApi(bytes, mimeType, displayName, apiKey) {
+function uploadToGeminiFileApi(blob, size, mimeType, displayName, apiKey) {
   try {
     // ① アップロード開始（アップロード先URLを取得）
     const startRes = UrlFetchApp.fetch(`https://generativelanguage.googleapis.com/upload/v1beta/files?key=${apiKey}`, {
@@ -312,7 +315,7 @@ function uploadToGeminiFileApi(bytes, mimeType, displayName, apiKey) {
       headers: {
         'X-Goog-Upload-Protocol': 'resumable',
         'X-Goog-Upload-Command': 'start',
-        'X-Goog-Upload-Header-Content-Length': String(bytes.length),
+        'X-Goog-Upload-Header-Content-Length': String(size),
         'X-Goog-Upload-Header-Content-Type': mimeType
       },
       payload: JSON.stringify({ file: { display_name: displayName } }),
@@ -330,7 +333,7 @@ function uploadToGeminiFileApi(bytes, mimeType, displayName, apiKey) {
       method: 'post',
       contentType: mimeType,
       headers: { 'X-Goog-Upload-Offset': '0', 'X-Goog-Upload-Command': 'upload, finalize' },
-      payload: bytes,
+      payload: blob,  // Blobのまま送信（バイト配列に展開しない）
       muteHttpExceptions: true
     });
     if (upRes.getResponseCode() !== 200) {

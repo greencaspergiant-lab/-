@@ -7,9 +7,17 @@ const PDF_LIB_URL = 'https://cdn.jsdelivr.net/npm/pdf-lib@1.17.1/dist/pdf-lib.mi
 // 画像をPDF化する際のページサイズ（長辺をA4相当 842pt に合わせる）
 const PAGE_LONG_SIDE_PT = 842;
 
+// 使用するGeminiモデル（503混雑時は再試行ごとに次のモデルへ切り替え）
+// ※2つ目以降に、Google AI Studioで利用可能なモデル名を追加すると混雑時の代替になります
+const GEMINI_MODELS = ['gemini-3.8-flash'];
+
+// 実行全体の締切（GASの6分制限に掛からないよう、再試行の待機もこの時刻までに収める）
+let RUN_DEADLINE = 0;
+
 async function checkForNewFiles() {
   const startTime = Date.now(); // 実行開始時間を記録
   const MAX_EXECUTION_TIME = 4.5 * 60 * 1000; // 4.5分（270,000ミリ秒）を上限とする
+  RUN_DEADLINE = startTime + 5.5 * 60 * 1000;  // 再試行は開始から5.5分以内に収める
 
   // 二重起動防止（前回の処理が実行中なら今回はスキップ）
   const lock = LockService.getScriptLock();
@@ -129,7 +137,6 @@ function getNewFilenameFromGemini(base64Data, mimeType, pageCount) {
     return null;
   }
 
-  const url = `https://generativelanguage.googleapis.com/v1/models/gemini-3.8-flash:generateContent?key=${apiKey}`;
 
   const prompt =
     "あなたは書類のスキャンデータを自動で整理するアシスタントです。\n" +
@@ -166,6 +173,8 @@ function getNewFilenameFromGemini(base64Data, mimeType, pageCount) {
   // 【追加2】エラー時（503や429）に、最大3回までリトライ（再挑戦）する仕組み
   let maxRetries = 3;
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    const model = GEMINI_MODELS[(attempt - 1) % GEMINI_MODELS.length];
+    const url = `https://generativelanguage.googleapis.com/v1/models/${model}:generateContent?key=${apiKey}`;
     try {
       const response = UrlFetchApp.fetch(url, options);
       const responseText = response.getContentText();
@@ -184,7 +193,7 @@ function getNewFilenameFromGemini(base64Data, mimeType, pageCount) {
       }
       // エラーが発生した場合（429や503など）
       else {
-        Logger.log(`【エラー】API呼び出し失敗 (ステータス: ${responseCode}) - 試行回数: ${attempt}/${maxRetries}`);
+        Logger.log(`【エラー】API呼び出し失敗 (ステータス: ${responseCode} / モデル: ${model}) - 試行回数: ${attempt}/${maxRetries}`);
         Logger.log(`詳細: ${responseText}`);
 
         // もしこれが最後の挑戦だったら、諦めてnullを返す
@@ -195,6 +204,12 @@ function getNewFilenameFromGemini(base64Data, mimeType, pageCount) {
 
         // 次の再試行まで少し待つ（1回目は20秒、2回目は40秒...と増やす）
         const waitTime = attempt * 20000;
+
+        // 待機＋再呼び出し（約1分）で6分制限を超えそうなら、今回は見送り（ファイルは未処理データに残り次回再処理）
+        if (RUN_DEADLINE && Date.now() + waitTime + 60000 > RUN_DEADLINE) {
+          Logger.log("実行時間の上限が近いため再試行を見送ります。このファイルは次回実行時に再処理されます。");
+          return null;
+        }
         Logger.log(`${waitTime/1000}秒後に再試行します...`);
         Utilities.sleep(waitTime);
       }

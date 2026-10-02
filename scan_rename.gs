@@ -490,7 +490,25 @@ function setupTrigger() {
  */
 function doGet() {
   ScriptApp.newTrigger('runOnce').timeBased().after(1000).create();
-  return HtmlService.createHtmlOutput('<p style="font-size:20px">処理を開始しました。1〜数分後に「処理済みデータ」をご確認ください。</p>');
+
+  // 未処理データの件数を表示
+  let count = 0;
+  const files = DriveApp.getFolderById(SOURCE_FOLDER_ID).getFiles();
+  while (files.hasNext()) {
+    const t = files.next().getMimeType();
+    if (t.includes('pdf') || t.includes('image')) count++;
+  }
+
+  const html =
+    '<div style="font-family:-apple-system,sans-serif;padding:24px;text-align:center">' +
+    '<p style="font-size:22px;font-weight:bold">処理を開始しました</p>' +
+    '<p style="font-size:17px">未処理データ：' + count + '件</p>' +
+    '<p style="font-size:15px;color:#666">1〜数分後に「処理済みデータ」をご確認ください。<br>' +
+    '件数が多い場合は、残りを5分ごとの自動実行で順次処理します。</p>' +
+    '</div>';
+  return HtmlService.createHtmlOutput(html)
+    .setTitle('スキャン整理')
+    .addMetaTag('viewport', 'width=device-width, initial-scale=1');
 }
 
 async function runOnce() {

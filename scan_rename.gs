@@ -42,25 +42,44 @@ async function checkForNewFiles() {
   try {
     const srcFolder = DriveApp.getFolderById(SOURCE_FOLDER_ID);
     const destFolder = DriveApp.getFolderById(DEST_FOLDER_ID);
-    const files = srcFolder.getFiles();
+    const props = PropertiesService.getScriptProperties();
 
-    while (files.hasNext()) {
+    // 対象ファイルを一覧化し、失敗回数の少ない順→古い順に並べる
+    // （失敗し続けるファイルが先頭に居座り、他のファイルが処理されなくなるのを防ぐ）
+    const targets = [];
+    const it = srcFolder.getFiles();
+    while (it.hasNext()) {
+      const f = it.next();
+      const t = f.getMimeType();
+      if (!t.includes('pdf') && !t.includes('image')) continue;
+      targets.push({ file: f, mimeType: t, fails: Number(props.getProperty('fail_' + f.getId()) || 0), created: f.getDateCreated().getTime() });
+    }
+    targets.sort((a, b) => (a.fails - b.fails) || (a.created - b.created));
+    Logger.log(`未処理データ: ${targets.length}件`);
+
+    for (let i = 0; i < targets.length; i++) {
       // 【追加1】GASの6分制限が近づいたら処理を安全に中断
       if (Date.now() - startTime > START_CUTOFF) {
         Logger.log("【警告】GASの6分制限に備え、今回の処理はここまでとします。残りのファイルは次回実行時に処理されます。");
         break;
       }
 
-      const file = files.next();
-      const mimeType = file.getMimeType();
+      const { file, mimeType, fails } = targets[i];
+      const failKey = 'fail_' + file.getId();
+      Logger.log(`処理開始: ${file.getName()}${fails ? `（過去の失敗: ${fails}回）` : ''}`);
 
-      if (!mimeType.includes('pdf') && !mimeType.includes('image')) continue;
-
-      Logger.log(`処理開始: ${file.getName()}`);
-      await processFile(file, mimeType, destFolder);
+      // 処理前に失敗回数を加算（6分超過で強制終了された場合も失敗として数えるため）。成功したら削除
+      props.setProperty(failKey, String(fails + 1));
+      let ok = false;
+      try {
+        ok = await processFile(file, mimeType, destFolder);
+      } catch (err) {
+        Logger.log(`【エラー】${file.getName()} の処理中にエラーが発生しました: ${err.toString()}`);
+      }
+      if (ok) props.deleteProperty(failKey);
 
       // API制限回避の待機（15秒）※待機後に処理開始期限を過ぎる場合は待たずに終了
-      if (files.hasNext()) {
+      if (i < targets.length - 1) {
         if (Date.now() - startTime + 15000 > START_CUTOFF) {
           Logger.log("今回の処理はここまでとします。残りのファイルは次回実行時に処理されます。");
           break;
@@ -109,7 +128,7 @@ async function processFile(file, mimeType, destFolder) {
   const result = getNewFilenameFromGemini(bytes, mimeType, pageCount, file.getName());
   if (!result) {
     Logger.log(`【失敗】ファイル名を取得できませんでした`);
-    return;
+    return false;
   }
 
   const rotations = result.rotations;
@@ -124,7 +143,7 @@ async function processFile(file, mimeType, destFolder) {
     file.setTrashed(true);
     Logger.log(`【成功】PDF変換${needsRotation ? '＋向き補正' : ''}＆移動完了: ${newName}`);
     Logger.log(`保存先リンク: ${newFile.getUrl()}`);
-    return;
+    return true;
   }
 
   // ② PDFで回転が必要 → 回転済みPDFを新規作成＋元ファイルはゴミ箱へ
@@ -135,7 +154,7 @@ async function processFile(file, mimeType, destFolder) {
     file.setTrashed(true);
     Logger.log(`【成功】向き補正＆リネーム＆移動完了: ${newName}`);
     Logger.log(`保存先リンク: ${newFile.getUrl()}`);
-    return;
+    return true;
   }
 
   // ③ 回転不要（またはHEIC等の変換非対応画像）→ 従来どおりリネーム＆移動のみ
@@ -148,6 +167,7 @@ async function processFile(file, mimeType, destFolder) {
   file.moveTo(destFolder);
   Logger.log(`【成功】リネーム＆移動完了: ${newName}`);
   Logger.log(`保存先リンク: ${file.getUrl()}`);
+  return true;
 }
 
 /**

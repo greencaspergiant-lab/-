@@ -5,9 +5,7 @@
  * 案件フォルダ内の「納品」フォルダに 写真台帳.xlsx / 写真台帳.pdf を出力する。
  *
  *  案件フォルダ名：  物件名_工事名        例）桜坂ハイツ101_原状回復工事
- *  写真ファイル名：  連番_場所_内容.jpg   例）01_洋室_クロス剥がれ.jpg
- *  （IMG_1234.jpg 等のままでも可。場所・内容は空欄で出力）
- *  Drive上で写真の「説明」を入力すると備考欄に反映。
+ *  写真はファイル名順に No.1〜 を採番（並び順を指定したい場合はファイル名先頭に 01_ 等を付ける）
  */
 
 const CONFIG = {
@@ -21,12 +19,10 @@ const CONFIG = {
 };
 
 const LAYOUT = {
-  COL_WIDTHS: [400, 80, 230],    // A:写真 B:項目 C:内容
+  COL_WIDTHS: [60, 650],         // A:No. B:写真
   HEADER_ROWS: 4,
-  BLOCK_ROWS: 5,                 // No./撮影日/場所/内容/備考
-  ROW_H: 56,
+  BLOCK_H: 280,
   GAP_H: 10,
-  LABELS: ['No.', '撮影日', '場所', '内容', '備考'],
 };
 
 /** 初回に1回だけ実行：10分おきの自動チェックを登録 */
@@ -85,7 +81,7 @@ function listPhotos_(folder) {
 
 function signature_(photos) {
   const src = photos
-    .map(f => [f.getId(), f.getName(), f.getLastUpdated().getTime(), f.getDescription() || ''].join(':'))
+    .map(f => [f.getId(), f.getName(), f.getLastUpdated().getTime()].join(':'))
     .join('|');
   return Utilities.base64Encode(Utilities.computeDigest(Utilities.DigestAlgorithm.MD5, src, Utilities.Charset.UTF_8));
 }
@@ -128,89 +124,75 @@ function buildLedger_(folder, photos) {
 
 function layoutPage_(sh, property, work, page, pageCount) {
   const L = LAYOUT;
-  const totalRows = L.HEADER_ROWS + CONFIG.PHOTOS_PER_PAGE * (L.BLOCK_ROWS + 1);
-  sh.getRange(1, 1, totalRows, 3).setFontFamily('Noto Sans JP').setFontSize(10).setVerticalAlignment('middle');
-  if (sh.getMaxColumns() > 3) sh.deleteColumns(4, sh.getMaxColumns() - 3);
+  const totalRows = L.HEADER_ROWS + CONFIG.PHOTOS_PER_PAGE * 2;
+  sh.getRange(1, 1, totalRows, 2).setFontFamily('Noto Sans JP').setFontSize(10).setVerticalAlignment('middle');
+  if (sh.getMaxColumns() > 2) sh.deleteColumns(3, sh.getMaxColumns() - 2);
   if (sh.getMaxRows() > totalRows) sh.deleteRows(totalRows + 1, sh.getMaxRows() - totalRows);
   L.COL_WIDTHS.forEach((w, i) => sh.setColumnWidth(i + 1, w));
   sh.setHiddenGridlines(true);
 
   sh.setRowHeight(1, 40);
-  sh.getRange('A1:C1').merge().setValue('写 真 台 帳').setFontSize(18).setFontWeight('bold').setHorizontalAlignment('center');
+  sh.getRange('A1:B1').merge().setValue('写 真 台 帳').setFontSize(18).setFontWeight('bold').setHorizontalAlignment('center');
   sh.setRowHeight(2, 24);
-  sh.getRange('A2').setValue('物件名：' + property + (work ? '　／　工事名：' + work : ''));
-  sh.getRange('B2:C2').merge().setValue(page + ' / ' + pageCount).setHorizontalAlignment('right');
+  sh.getRange('A2:B2').merge().setValue('物件名：' + property + (work ? '　／　工事名：' + work : ''));
   sh.setRowHeight(3, 24);
-  sh.getRange('A3').setValue(CONFIG.COMPANY);
-  sh.getRange('B3:C3').merge()
-    .setValue('作成日：' + Utilities.formatDate(new Date(), 'Asia/Tokyo', 'yyyy/MM/dd'))
+  sh.getRange('A3:B3').merge()
+    .setValue(CONFIG.COMPANY + '　作成日：' + Utilities.formatDate(new Date(), 'Asia/Tokyo', 'yyyy/MM/dd') +
+      '　' + page + ' / ' + pageCount)
     .setHorizontalAlignment('right');
   sh.setRowHeight(4, 8);
 
   for (let i = 0; i < CONFIG.PHOTOS_PER_PAGE; i++) {
     const r = blockTop_(i);
-    sh.setRowHeights(r, L.BLOCK_ROWS, L.ROW_H);
-    sh.setRowHeight(r + L.BLOCK_ROWS, L.GAP_H);
-    sh.getRange(r, 1, L.BLOCK_ROWS, 1).merge();
-    sh.getRange(r, 2, L.BLOCK_ROWS, 1)
-      .setValues(L.LABELS.map(v => [v]))
-      .setBackground('#f2f2f2').setHorizontalAlignment('center');
-    sh.getRange(r, 3, L.BLOCK_ROWS, 1).setWrap(true);
-    sh.getRange(r, 1, L.BLOCK_ROWS, 3)
-      .setBorder(true, true, true, true, true, true, '#666666', SpreadsheetApp.BorderStyle.SOLID);
+    sh.setRowHeight(r, L.BLOCK_H);
+    sh.setRowHeight(r + 1, L.GAP_H);
+    sh.getRange(r, 1).setHorizontalAlignment('center').setFontSize(12).setFontWeight('bold');
+    sh.getRange(r, 1, 1, 2)
+      .setBorder(true, true, true, true, true, false, '#666666', SpreadsheetApp.BorderStyle.SOLID);
   }
 }
 
 function blockTop_(i) {
-  return LAYOUT.HEADER_ROWS + 1 + i * (LAYOUT.BLOCK_ROWS + 1);
+  return LAYOUT.HEADER_ROWS + 1 + i * 2;
 }
 
 function fillBlock_(sh, i, no, file) {
   const L = LAYOUT;
   const r = blockTop_(i);
-  const meta = driveMeta_(file.getId());
-  const info = parseFileName_(file.getName());
+  sh.getRange(r, 1).setValue(no);
 
-  sh.getRange(r, 3, L.BLOCK_ROWS, 1).setValues([
-    [no],
-    [formatExifDate_(meta.imageMediaMetadata && meta.imageMediaMetadata.time)],
-    [info.place],
-    [info.content],
-    [file.getDescription() || ''],
-  ]);
-  sh.getRange(r, 3).setHorizontalAlignment('left');
-
-  const boxW = L.COL_WIDTHS[0] - 12;
-  const boxH = L.BLOCK_ROWS * L.ROW_H - 12;
+  const boxW = L.COL_WIDTHS[1] - 12;
+  const boxH = L.BLOCK_H - 12;
   try {
-    const img = sh.insertImage(imageBlob_(file, meta), 1, r);
+    const img = sh.insertImage(imageBlob_(file), 2, r);
     const scale = Math.min(boxW / img.getWidth(), boxH / img.getHeight());
     const w = Math.round(img.getWidth() * scale);
     const h = Math.round(img.getHeight() * scale);
     img.setWidth(w).setHeight(h)
-      .setAnchorCellXOffset(Math.round((L.COL_WIDTHS[0] - w) / 2))
-      .setAnchorCellYOffset(Math.round((L.BLOCK_ROWS * L.ROW_H - h) / 2));
+      .setAnchorCellXOffset(Math.round((L.COL_WIDTHS[1] - w) / 2))
+      .setAnchorCellYOffset(Math.round((L.BLOCK_H - h) / 2));
   } catch (e) {
-    sh.getRange(r, 1).setValue('画像取得失敗：' + file.getName()).setHorizontalAlignment('center');
+    sh.getRange(r, 2).setValue('画像取得失敗：' + file.getName()).setHorizontalAlignment('center');
     console.warn(file.getName(), e);
   }
 }
 
-/** Drive API v3 でサムネイルURL・撮影日時を取得 */
-function driveMeta_(id) {
+/** Drive API v3 でサムネイルURLを取得 */
+function thumbnailLink_(id) {
   const url = 'https://www.googleapis.com/drive/v3/files/' + id +
-    '?fields=thumbnailLink,imageMediaMetadata(time)&supportsAllDrives=true';
+    '?fields=thumbnailLink&supportsAllDrives=true';
   const res = UrlFetchApp.fetch(url, {
     headers: { Authorization: 'Bearer ' + ScriptApp.getOAuthToken() },
     muteHttpExceptions: true,
   });
-  return res.getResponseCode() === 200 ? JSON.parse(res.getContentText()) : {};
+  return res.getResponseCode() === 200 ? JSON.parse(res.getContentText()).thumbnailLink : null;
 }
 
 /** 縮小画像を取得（スマホ写真は insertImage の上限2MBを超えるため）。HEICもJPEG化される */
-function imageBlob_(file, meta) {
-  if (meta.thumbnailLink) {
-    const res = UrlFetchApp.fetch(meta.thumbnailLink.replace(/=s\d+$/, '=s' + CONFIG.THUMB_SIZE), {
+function imageBlob_(file) {
+  const link = thumbnailLink_(file.getId());
+  if (link) {
+    const res = UrlFetchApp.fetch(link.replace(/=s\d+$/, '=s' + CONFIG.THUMB_SIZE), {
       headers: { Authorization: 'Bearer ' + ScriptApp.getOAuthToken() },
       muteHttpExceptions: true,
     });
@@ -218,22 +200,6 @@ function imageBlob_(file, meta) {
   }
   if (file.getSize() < 2 * 1024 * 1024) return file.getBlob();
   throw new Error('サムネイル未生成かつ2MB超');
-}
-
-/** 「01_洋室_クロス剥がれ.jpg」→ 場所:洋室 / 内容:クロス剥がれ */
-function parseFileName_(name) {
-  const stem = name.replace(/\.[^.]+$/, '');
-  if (/^(IMG|DSC|DSCN|PXL|MVIMG|Screenshot)[_\-\s]|^\d{8}[_\-]/i.test(stem)) {
-    return { place: '', content: '' };
-  }
-  const parts = stem.split('_').filter(Boolean);
-  if (parts.length && /^\d+$/.test(parts[0])) parts.shift();
-  return { place: parts[0] || '', content: parts.slice(1).join(' ') };
-}
-
-function formatExifDate_(t) {
-  const m = t && String(t).match(/^(\d{4})[:\-](\d{2})[:\-](\d{2})/);
-  return m ? m[1] + '/' + m[2] + '/' + m[3] : '';
 }
 
 function exportBlob_(id, format, name) {

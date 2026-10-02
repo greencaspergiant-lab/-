@@ -12,6 +12,12 @@ const PRIMARY_MODEL = 'gemini-3.8-flash';
 // メインが混雑（503等）の場合に切り替える代替モデルの数（利用可能なflash系モデルから自動選定）
 const MAX_FALLBACK_MODELS = 2;
 
+// 向き補正の設定
+// ENABLE_ROTATION = false にすると、向きは変えずにファイル名の変更＆移動のみ行う
+const ENABLE_ROTATION = true;
+// この容量を超えるPDFは向き補正を行わず、ファイル名の変更＆移動のみ行う（GASのメモリ・時間制限対策）
+const ROTATE_MAX_BYTES = 15 * 1024 * 1024;  // 15MB
+
 // この容量を超えるファイルは、Gemini File API（アップロード方式）で送信する
 // （直接送信はBase64化で約1.33倍に膨らみ、20MBの上限や混雑時の失敗に掛かりやすいため）
 const INLINE_MAX_BYTES = 8 * 1024 * 1024;   // 8MB
@@ -76,12 +82,19 @@ async function checkForNewFiles() {
 async function processFile(file, mimeType, destFolder) {
   const bytes = file.getBlob().getBytes();
   const isPdf = mimeType === MimeType.PDF;
-  const isConvertibleImage = mimeType === MimeType.JPEG || mimeType === MimeType.PNG;
+  const isConvertibleImage = ENABLE_ROTATION && (mimeType === MimeType.JPEG || mimeType === MimeType.PNG);
+
+  // 向き補正を行うか判定（無効設定、または大容量PDFの場合はファイル名の変更のみ）
+  const rotate = ENABLE_ROTATION && !(isPdf && bytes.length > ROTATE_MAX_BYTES);
+  if (ENABLE_ROTATION && !rotate) {
+    Logger.log(`容量が大きいため（${(bytes.length / 1024 / 1024).toFixed(1)}MB）、向き補正は行わずファイル名の変更のみ行います。`);
+  }
 
   // PDFはページ数を取得してGeminiに伝える（ページごとの向き判定のため）
+  // ※向き補正を行わない場合は pageCount = 0（ファイル名のみ判定）
   let pdfDoc = null;
-  let pageCount = 1;
-  if (isPdf) {
+  let pageCount = rotate ? 1 : 0;
+  if (isPdf && rotate) {
     try {
       const { PDFDocument } = loadPdfLib();
       pdfDoc = await PDFDocument.load(new Uint8Array(bytes), { ignoreEncryption: true });
@@ -178,8 +191,14 @@ function getNewFilenameFromGemini(bytes, mimeType, pageCount, displayName) {
  */
 function requestGemini(apiKey, filePart, pageCount) {
 
-  const prompt =
-    "あなたは書類のスキャンデータを自動で整理するアシスタントです。\n" +
+  const prompt = pageCount === 0
+    // 向き補正なし：ファイル名のみ判定
+    ? "あなたは書類のスキャンデータを自動で整理するアシスタントです。\n" +
+      "添付データの内容（日付、書類種別、相手先名、金額等）を読み取り、『YYYYMMDD_書類種別_相手先名.pdf』形式の適切なファイル名を判定してください。\n" +
+      "出力は次のJSONのみとし、余計なテキストや解説、コードブロック記号は一切含めないでください。\n" +
+      '{"filename":"20260929_領収書_〇〇不動産.pdf"}'
+    // 向き補正あり：ファイル名＋各ページの回転角度を判定
+    : "あなたは書類のスキャンデータを自動で整理するアシスタントです。\n" +
     "添付データ（全" + pageCount + "ページ）について、次の2点を判定してください。\n" +
     "1. 内容（日付、書類種別、相手先名、金額等）を読み取り、『YYYYMMDD_書類種別_相手先名.pdf』形式の適切なファイル名\n" +
     "2. 各ページの文字が正しく読める向き（正立）にするために、時計回りに何度回転させる必要があるか（0/90/180/270のいずれか）。" +

@@ -11,6 +11,13 @@ async function checkForNewFiles() {
   const startTime = Date.now(); // 実行開始時間を記録
   const MAX_EXECUTION_TIME = 4.5 * 60 * 1000; // 4.5分（270,000ミリ秒）を上限とする
 
+  // 二重起動防止（前回の処理が実行中なら今回はスキップ）
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(0)) {
+    Logger.log("前回の処理が実行中のため、今回はスキップします。");
+    return;
+  }
+
   try {
     const srcFolder = DriveApp.getFolderById(SOURCE_FOLDER_ID);
     const destFolder = DriveApp.getFolderById(DEST_FOLDER_ID);
@@ -39,6 +46,8 @@ async function checkForNewFiles() {
     }
   } catch (e) {
     Logger.log(`【エラー発生】: ` + e.toString());
+  } finally {
+    lock.releaseLock();
   }
 }
 
@@ -283,4 +292,29 @@ function getExtension(name) {
 
 function withExtension(baseName, ext) {
   return `${baseName}.${ext}`;
+}
+
+/**
+ * 【起動方法①】定期実行トリガーの設定（最初に1回だけ手動実行）
+ */
+function setupTrigger() {
+  ScriptApp.getProjectTriggers()
+    .filter(t => t.getHandlerFunction() === 'checkForNewFiles')
+    .forEach(t => ScriptApp.deleteTrigger(t));
+  ScriptApp.newTrigger('checkForNewFiles').timeBased().everyMinutes(10).create();
+}
+
+/**
+ * 【起動方法②】WebアプリURLを開くと即時実行（スマホのホーム画面に置くと便利）
+ */
+function doGet() {
+  ScriptApp.newTrigger('runOnce').timeBased().after(1000).create();
+  return HtmlService.createHtmlOutput('<p style="font-size:20px">処理を開始しました。1〜数分後に「処理済みデータ」をご確認ください。</p>');
+}
+
+async function runOnce() {
+  ScriptApp.getProjectTriggers()
+    .filter(t => t.getHandlerFunction() === 'runOnce')
+    .forEach(t => ScriptApp.deleteTrigger(t));
+  await checkForNewFiles();
 }

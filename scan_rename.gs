@@ -337,3 +337,15 @@ async function runOnce() {
     .forEach(t => ScriptApp.deleteTrigger(t));
   await checkForNewFiles();
 }
+
+/**
+ * 【補助】このAPIキーで利用可能なGeminiモデルの一覧をログに出力（GEMINI_MODELSの代替候補確認用）
+ */
+function listGeminiModels() {
+  const apiKey = PropertiesService.getScriptProperties().getProperty('GEMINI_API_KEY');
+  const res = UrlFetchApp.fetch(`https://generativelanguage.googleapis.com/v1/models?pageSize=1000&key=${apiKey}`, { muteHttpExceptions: true });
+  const models = (JSON.parse(res.getContentText()).models || [])
+    .filter(m => (m.supportedGenerationMethods || []).includes('generateContent'))
+    .map(m => m.name.replace('models/', ''));
+  Logger.log(models.join('\n'));
+}
